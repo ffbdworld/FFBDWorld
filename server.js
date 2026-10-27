@@ -335,23 +335,126 @@ app.post('/v1/orders', requireAuth, asyncRoute(async(req,res)=>{const productId=
 app.post('/v1/help/messages', requireAuth, asyncRoute(async(req,res)=>{const ref=db.collection(`supportChats/${req.user.uid}/messages`).doc();await ref.set({uid:req.user.uid,text:clean(req.body?.text,5000),sender:'user',createdAt:now()});await db.doc(`supportChatsIndex/${req.user.uid}`).set({uid:req.user.uid,lastMessage:clean(req.body?.text,500),updatedAt:now(),unreadForAdmin:true},{merge:true});ok(res,{id:ref.id})}));
 
 // Admin API
-app.patch('/v1/admin/stars/purchases/:id', requireAuth, requireAdmin, asyncRoute(async(req,res)=>{
-  const status=clean(req.body?.status,20); if(!['approved','rejected'].includes(status)) return bad(res,400,'Invalid status.');
-  const purchase=db.doc(`starPurchases/${req.params.id}`);
-  await db.runTransaction(async tx=>{ const ps=await tx.get(purchase); if(!ps.exists) throw new Error('Purchase not found.'); const p=ps.data()||{}; if(p.status!=='pending') throw new Error('Purchase already reviewed.');
-    if(status==='approved'){ const u=db.doc(`userProfiles/${p.uid}`); const us=await tx.get(u); const d=us.exists?us.data()||{}:{}; tx.set(u,{starsAvailable:Number(d.starsAvailable||0)+Number(p.stars||0),starsPurchased:Number(d.starsPurchased||0)+Number(p.stars||0),updatedAt:now()},{merge:true}); }
-    tx.update(purchase,{status,reviewedBy:req.user.uid,reviewedAt:now()}); });
-  ok(res,{updated:true,status});
-}));
-app.patch('/v1/admin/stars/withdrawals/:id', requireAuth, requireAdmin, asyncRoute(async(req,res)=>{
-  const status=clean(req.body?.status,20); if(!['approved','paid','rejected'].includes(status)) return bad(res,400,'Invalid status.');
-  const wr=db.doc(`starWithdrawals/${req.params.id}`);
-  await db.runTransaction(async tx=>{ const ws=await tx.get(wr); if(!ws.exists) throw new Error('Withdrawal not found.'); const w=ws.data()||{}; if(!['pending','approved'].includes(w.status)) throw new Error('Withdrawal already finalized.'); const u=db.doc(`userProfiles/${w.uid}`); const us=await tx.get(u); const d=us.exists?us.data()||{}:{};
-    if(status==='rejected'){ tx.set(u,{starsAvailable:Number(d.starsAvailable||0)+Number(w.stars||0),pendingWithdrawalStars:Math.max(0,Number(d.pendingWithdrawalStars||0)-Number(w.stars||0)),updatedAt:now()},{merge:true}); }
-    else if(status==='paid'){ tx.set(u,{pendingWithdrawalStars:Math.max(0,Number(d.pendingWithdrawalStars||0)-Number(w.stars||0)),updatedAt:now()},{merge:true}); }
-    tx.update(wr,{status,reviewedBy:req.user.uid,reviewedAt:now()}); });
-  ok(res,{updated:true,status});
-}));
+// Admin: Approve/reject Stars purchase
+app.patch('/v1/admin/stars/purchases/:id', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const status = String(req.body?.status || '').trim();
+    if (!['approved', 'rejected'].includes(status)) {
+      return res.status(400).json({ ok: false, error: 'Invalid status' });
+    }
+
+    const purchase = db.collection('starPurchases').doc(req.params.id);
+
+    await db.runTransaction(async (tx) => {
+      const snap = await tx.get(purchase);
+      if (!snap.exists) throw new Error('Not found');
+
+      const data = snap.data();
+      if (data.status !== 'pending') throw new Error('Already processed');
+
+      const stars = Number(data.stars);
+      if (!Number.isSafeInteger(stars) || stars <= 0) {
+        throw new Error('Invalid stars amount');
+      }
+
+      const user = db.collection('userProfiles').doc(data.uid);
+      const userSnap = await tx.get(user);
+      if (!userSnap.exists) throw new Error('User not found');
+
+      if (status === 'approved') {
+        tx.update(user, {
+          stars: admin.firestore.FieldValue.increment(stars)
+        });
+      }
+
+      tx.update(purchase, {
+        status,
+        reviewedBy: req.user.uid,
+        reviewedAt: admin.firestore.Timestamp.now()
+      });
+    });
+
+    return res.json({ ok: true, updated: true, status });
+  } catch (err) {
+    const knownErrors = ['Not found', 'Already processed', 'Invalid stars amount', 'User not found'];
+    const message = knownErrors.includes(err.message) ? err.message : 'Internal server error';
+    const code = message === 'Not found' || message === 'User not found' ? 404
+      : message === 'Already processed' ? 409
+      : message === 'Invalid stars amount' ? 400 : 500;
+
+    return res.status(code).json({ ok: false, error: message });
+  }
+});
+
+
+// Admin: Mark withdrawal paid/rejected
+app.patch('/v1/admin/stars/withdrawals/:id', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const status = String(req.body?.status || '').trim();
+    if (!['paid', 'rejected'].includes(status)) {
+      return res.status(400).json({ ok: false, error: 'Invalid status' });
+    }
+
+    const withdrawal = db.collection('starWithdrawals').doc(req.params.id);
+
+    await db.runTransaction(async (tx) => {
+      const snap = await tx.get(withdrawal);
+      if (!snap.exists) throw new Error('Not found');
+
+      const data = snap.data();
+      if (data.status !== 'pending') throw new Error('Already processed');
+
+      const stars = Number(data.stars);
+      if (!Number.isSafeInteger(stars) || stars <= 0) {
+        throw new Error('Invalid stars amount');
+      }
+
+      const uid = data.uid;
+      if (typeof uid !== 'string' || !uid) throw new Error('Invalid user');
+
+      const user = db.collection('userProfiles').doc(uid);
+      const userSnap = await tx.get(user);
+      if (!userSnap.exists) throw new Error('User not found');
+
+      const profile = userSnap.data();
+      const pending = Number(profile.pendingWithdrawal || 0);
+      if (!Number.isFinite(pending) || pending < stars) {
+        throw new Error('Invalid pending withdrawal balance');
+      }
+
+      if (status === 'rejected') {
+        tx.update(user, {
+          starsAvailable: admin.firestore.FieldValue.increment(stars),
+          pendingWithdrawal: admin.firestore.FieldValue.increment(-stars)
+        });
+      } else {
+        tx.update(user, {
+          pendingWithdrawal: admin.firestore.FieldValue.increment(-stars)
+        });
+      }
+
+      tx.update(withdrawal, {
+        status,
+        reviewedBy: req.user.uid,
+        reviewedAt: admin.firestore.Timestamp.now()
+      });
+    });
+
+    return res.json({ ok: true, updated: true, status });
+  } catch (err) {
+    const knownErrors = [
+      'Not found', 'Already processed', 'Invalid stars amount',
+      'Invalid user', 'User not found', 'Invalid pending withdrawal balance'
+    ];
+    const message = knownErrors.includes(err.message) ? err.message : 'Internal server error';
+    const code = message === 'Not found' || message === 'User not found' ? 404
+      : message === 'Already processed' ? 409
+      : message === 'Invalid stars amount' || message === 'Invalid user'
+        || message === 'Invalid pending withdrawal balance' ? 400 : 500;
+
+    return res.status(code).json({ ok: false, error: message });
+  }
+});
 
 app.patch('/v1/admin/stars/gifts/:id', requireAuth, requireAdmin, asyncRoute(async(req,res)=>{
   const status=clean(req.body?.status,20); if(!['approved','rejected'].includes(status)) return bad(res,400,'Invalid status.');
